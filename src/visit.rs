@@ -401,9 +401,13 @@ impl DiscoveryVisitor<'_> {
         if matches!(expr, Expr::Return(_)) {
             return; // its value is mutated where `return` is visited
         }
-        let orig = expr.to_token_stream().to_pretty_string();
+        let orig = canonical_value(expr);
         for rep in repls {
-            if rep.to_pretty_string() != orig {
+            let same = match syn::parse2::<Expr>(rep.clone()) {
+                Ok(rep_expr) => canonical_value(&rep_expr) == orig,
+                Err(_) => rep.to_pretty_string() == expr.to_token_stream().to_pretty_string(),
+            };
+            if !same {
                 self.collect_mutant(expr.span().into(), None, rep, Genre::ReturnValue);
             }
         }
@@ -869,6 +873,42 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
 /// `Default::default()` itself.
 fn is_default_like(expr: &Expr) -> bool {
     match expr {
+        Expr::Paren(syn::ExprParen { expr, .. }) | Expr::Group(syn::ExprGroup { expr, .. }) => {
+            is_default_like(expr)
+        }
+        // `[0; N]`, `[]`, `[false, 0]`, `()`, `(0, None)`: each element its default.
+        Expr::Repeat(syn::ExprRepeat { expr, .. }) => is_default_like(expr),
+        Expr::Array(syn::ExprArray { elems, .. }) | Expr::Tuple(syn::ExprTuple { elems, .. }) => {
+            elems.iter().all(is_default_like)
+        }
+        // `&[]`, `&mut []`: the empty slice, a slice reference's default.
+        Expr::Reference(syn::ExprReference { expr, .. }) => {
+            matches!(&**expr, Expr::Array(syn::ExprArray { elems, .. }) if elems.is_empty())
+        }
+        Expr::Path(ExprPath { path, .. }) if path_ends_with(path, "PhantomData") => true,
+        // `ptr::null()`, `ptr::null_mut()`: what a raw pointer field's `Default`-like
+        // replacement would be.
+        Expr::Call(syn::ExprCall { func, args, .. })
+            if args.is_empty()
+                && matches!(&**func, Expr::Path(ExprPath { path, .. }) if path_ends_with(path, "null") || path_ends_with(path, "null_mut")) =>
+        {
+            true
+        }
+        // `AtomicUsize::new(0)`, `Cell::new(false)`, `Mutex::new(Vec::new())`: wrappers
+        // whose `Default` wraps the inner default; and `Vec::leak(Vec::new())`, the empty
+        // slice.
+        Expr::Call(syn::ExprCall { func, args, .. })
+            if args.len() == 1 && is_default_like(&args[0]) =>
+        {
+            matches!(&**func, Expr::Path(ExprPath { path, .. })
+            if path.segments.len() >= 2 && {
+                let n = path.segments.len();
+                let ty = path.segments[n - 2].ident.to_string();
+                let f = &path.segments[n - 1].ident;
+                (f == "new" && (ty.starts_with("Atomic") || ["Cell", "RefCell", "UnsafeCell", "Mutex", "RwLock", "Wrapping"].contains(&ty.as_str())))
+                    || (f == "leak" && ty == "Vec")
+            })
+        }
         Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
             syn::Lit::Int(i) => i.base10_digits() == "0",
             syn::Lit::Float(f) => {
@@ -887,6 +927,28 @@ fn is_default_like(expr: &Expr) -> bool {
             matches!(&**func, Expr::Path(ExprPath { path, .. }) if path_ends_with(path, "new") || path_ends_with(path, "default"))
         }
         _ => false,
+    }
+}
+
+/// A value's form for telling a replacement that is the same value: every default-like
+/// value (and `Default::default()`) is one form, so `&[]` and `Vec::leak(Vec::new())`, or
+/// `0` and `Default::default()`, are the same; `Some(..)`, `Ok(..)` and other calls
+/// compare their arguments so. Anything else is its source.
+fn canonical_value(expr: &Expr) -> String {
+    match expr {
+        Expr::Paren(syn::ExprParen { expr, .. }) | Expr::Group(syn::ExprGroup { expr, .. }) => {
+            canonical_value(expr)
+        }
+        e if is_default_like(e) => "<default>".to_owned(),
+        Expr::Call(syn::ExprCall { func, args, .. }) => format!(
+            "{}({})",
+            func.to_token_stream().to_pretty_string(),
+            args.iter()
+                .map(canonical_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        e => e.to_token_stream().to_pretty_string(),
     }
 }
 
@@ -1322,6 +1384,13 @@ mod test {
                 n
             }
             fn lit(a: u64) -> S { S { a: a, b: Default::default(), c: 0, d: Vec::new(), e: None, f: false } }
+            fn lit2() -> T {
+                T { g: [0; 8], h: core::ptr::null(), i: PhantomData, j: AtomicUsize::new(0), k: &[], l: (0, None), m: AtomicUsize::new(3) }
+            }
+            fn empty(x: &[u8]) -> &[u8] {
+                assert!(x.len() < 9);
+                &[]
+            }
             fn long(a: bool, b: bool) -> u8 {
                 let x = 1;
                 if a
@@ -1362,6 +1431,9 @@ mod test {
                 "replace n + 7 with 0 in give",
                 "replace n + 7 with 1 in give",
                 "replace a with Default::default() in lit",
+                "replace AtomicUsize::new(3) with Default::default() in lit2",
+                "replace &[] with Vec::leak(vec![0]) in empty",
+                "replace &[] with Vec::leak(vec![1]) in empty",
                 "replace if a && b { 2 } else { x } with 0 in long",
                 "replace if a && b { 2 } else { x } with 1 in long",
                 "replace a && b with true in long",
