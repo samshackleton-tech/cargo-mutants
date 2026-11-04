@@ -845,9 +845,9 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         // field is written `name: value` and the value isn't that already.
         if self.options.extra_mutations {
             for field in &i.fields {
-                if field.colon_token.is_some() {
+                if field.colon_token.is_some() && !is_default_like(&field.expr) {
                     let rep = quote! { Default::default() };
-                    if field.expr.to_token_stream().to_pretty_string() != rep.to_pretty_string() {
+                    {
                         self.collect_mutant(
                             field.expr.span().into(),
                             None,
@@ -860,6 +860,33 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
 
         syn::visit::visit_expr_struct(self, i);
+    }
+}
+
+/// Whether a field's value is very likely its type's default already, so that replacing it
+/// with `Default::default()` would change nothing: `0`, `0.0`, `false`, `None`, `""`, a
+/// zero-argument `...::new()` (by convention `Default` agrees with it), or
+/// `Default::default()` itself.
+fn is_default_like(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Int(i) => i.base10_digits() == "0",
+            syn::Lit::Float(f) => {
+                f.base10_digits()
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    == "0"
+                    || f.base10_digits() == "0"
+            }
+            syn::Lit::Bool(b) => !b.value,
+            syn::Lit::Str(s) => s.value().is_empty(),
+            _ => false,
+        },
+        Expr::Path(ExprPath { path, .. }) => path.is_ident("None"),
+        Expr::Call(syn::ExprCall { func, args, .. }) if args.is_empty() => {
+            matches!(&**func, Expr::Path(ExprPath { path, .. }) if path_ends_with(path, "new") || path_ends_with(path, "default"))
+        }
+        _ => false,
     }
 }
 
@@ -1294,7 +1321,17 @@ mod test {
                 }
                 n
             }
-            fn lit(a: u64) -> S { S { a: a, b: Default::default() } }
+            fn lit(a: u64) -> S { S { a: a, b: Default::default(), c: 0, d: Vec::new(), e: None, f: false } }
+            fn long(a: bool, b: bool) -> u8 {
+                let x = 1;
+                if a
+                    && b
+                {
+                    2
+                } else {
+                    x
+                }
+            }
         "};
         let extra = names(code, &extra());
         let default = names(code, &Options::default());
@@ -1325,6 +1362,10 @@ mod test {
                 "replace n + 7 with 0 in give",
                 "replace n + 7 with 1 in give",
                 "replace a with Default::default() in lit",
+                "replace if a && b { 2 } else { x } with 0 in long",
+                "replace if a && b { 2 } else { x } with 1 in long",
+                "replace a && b with true in long",
+                "replace a && b with false in long",
             ]
         );
         // And every default mutant is still there, in order.
@@ -1340,6 +1381,8 @@ mod test {
                 .any(|n| n.contains("Some(f)") || n.contains("replace 1 with"))
         );
         assert!(!extra.iter().any(|n| n.contains("replace 2 + 3")));
+        // Every name on one line.
+        assert!(extra.iter().all(|n| !n.contains('\n')));
     }
 
     #[test]

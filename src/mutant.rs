@@ -237,6 +237,14 @@ impl Mutant {
                     .yellow(),
                 );
             }
+            Genre::ReturnValue | Genre::Condition | Genre::StructFieldValue => {
+                // The extra mutations' originals may span lines (a tail `if`, a long
+                // condition): on one line, as match guards are, so a name is one line.
+                v.push(s("replace "));
+                v.push(s(squash_lines(self.original_text().as_ref())).yellow());
+                v.push(s(" with "));
+                v.push(s(self.replacement_text()).bright().yellow());
+            }
             Genre::StructField => {
                 if let Some(MutationTarget::StructLiteralField {
                     field_name,
