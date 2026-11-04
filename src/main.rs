@@ -389,6 +389,13 @@ pub struct Args {
     #[arg(long, help_heading = "Filters")]
     skip_calls_defaults: Option<bool>,
 
+    /// Also generate mutants that the default set leaves out: inside `unsafe fn`s; a function's
+    /// return values with the statements before them kept (its tail expression, and each
+    /// `return`); `if` conditions as `true` and `false`, and `while` conditions as `false`; and
+    /// each struct literal field's value as `Default::default()`.
+    #[arg(long, help_heading = "Filters")]
+    extra_mutations: bool,
+
     /// Generate mutations in every package in the workspace.
     #[arg(long, help_heading = "Filters")]
     workspace: bool,

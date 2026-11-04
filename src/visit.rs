@@ -149,6 +149,7 @@ pub fn walk_file(
         fn_stack: Vec::new(),
         source_file: source_file.clone(),
         options,
+        return_repls: Vec::new(),
     };
     visitor.visit_file(&syn_file);
     Ok((visitor.mutants, visitor.external_mods))
@@ -284,6 +285,11 @@ struct DiscoveryVisitor<'o> {
     error_exprs: &'o [Expr],
 
     options: &'o Options,
+
+    /// The replacement values for a `return` here (extra mutations): one entry a function or
+    /// closure we're inside, the innermost last; a closure's is empty, since its `return`s
+    /// return from it, whose type we don't know.
+    return_repls: Vec<Vec<TokenStream>>,
 }
 
 impl DiscoveryVisitor<'_> {
@@ -351,7 +357,7 @@ impl DiscoveryVisitor<'_> {
                 );
             } else {
                 let orig_block = block.to_token_stream().to_pretty_string();
-                for rep in repls {
+                for rep in &repls {
                     // Comparing strings is a kludge for proc_macro2 not (yet) apparently
                     // exposing any way to compare token streams...
                     //
@@ -365,13 +371,47 @@ impl DiscoveryVisitor<'_> {
                     if orig_block == new_block {
                         trace!("Replacement is the same as the function body; skipping");
                     } else {
-                        self.collect_mutant(body_span, None, &rep, Genre::FnValue);
+                        self.collect_mutant(body_span, None, rep, Genre::FnValue);
                     }
                 }
             }
+            if self.options.extra_mutations {
+                self.collect_tail_mutants(block, &repls);
+            }
+            self.return_repls.push(repls);
         } else {
             warn!("collect_fn_mutants called while not in a function?");
         }
+    }
+
+    /// The tail expression of a body of several statements, replaced with each value
+    /// (extra mutations): the statements before it, assertions among them, still run.
+    fn collect_tail_mutants(&mut self, block: &Block, repls: &[TokenStream]) {
+        if block.stmts.len() < 2 {
+            return; // a body of one expression: the whole-body mutants are these
+        }
+        if let Some(syn::Stmt::Expr(tail, None)) = block.stmts.last() {
+            self.collect_value_mutants(tail, repls);
+        }
+    }
+
+    /// `expr` replaced with each of `repls`, skipping a replacement that is the expression
+    /// itself.
+    fn collect_value_mutants(&mut self, expr: &Expr, repls: &[TokenStream]) {
+        if matches!(expr, Expr::Return(_)) {
+            return; // its value is mutated where `return` is visited
+        }
+        let orig = expr.to_token_stream().to_pretty_string();
+        for rep in repls {
+            if rep.to_pretty_string() != orig {
+                self.collect_mutant(expr.span().into(), None, rep, Genre::ReturnValue);
+            }
+        }
+    }
+
+    /// Whether to skip a function for its signature: unsafe fns, unless extra mutations.
+    fn sig_excluded(&self, sig: &Signature) -> bool {
+        fn_sig_excluded(sig) && !self.options.extra_mutations
     }
 
     /// Call a function with a namespace pushed onto the stack.
@@ -441,12 +481,13 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         )
         .entered();
         trace!("visit fn");
-        if fn_sig_excluded(&i.sig) || attrs_excluded(&i.attrs) || block_is_empty(&i.block) {
+        if self.sig_excluded(&i.sig) || attrs_excluded(&i.attrs) || block_is_empty(&i.block) {
             return;
         }
         let function = self.enter_function(&i.sig.ident, &i.sig.output, i.span());
         self.collect_fn_mutants(&i.sig, &i.block);
         syn::visit::visit_item_fn(self, i);
+        self.return_repls.pop();
         self.leave_function(function);
     }
 
@@ -461,7 +502,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             name = function_name
         )
         .entered();
-        if fn_sig_excluded(&i.sig)
+        if self.sig_excluded(&i.sig)
             || attrs_excluded(&i.attrs)
             || i.sig.ident == "new"
             || block_is_empty(&i.block)
@@ -471,6 +512,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         let function = self.enter_function(&i.sig.ident, &i.sig.output, i.span());
         self.collect_fn_mutants(&i.sig, &i.block);
         syn::visit::visit_impl_item_fn(self, i);
+        self.return_repls.pop();
         self.leave_function(function);
     }
 
@@ -483,7 +525,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             name = function_name
         )
         .entered();
-        if fn_sig_excluded(&i.sig) || attrs_excluded(&i.attrs) || i.sig.ident == "new" {
+        if self.sig_excluded(&i.sig) || attrs_excluded(&i.attrs) || i.sig.ident == "new" {
             return;
         }
         if let Some(block) = &i.default {
@@ -493,6 +535,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             let function = self.enter_function(&i.sig.ident, &i.sig.output, i.span());
             self.collect_fn_mutants(&i.sig, block);
             syn::visit::visit_trait_item_fn(self, i);
+            self.return_repls.pop();
             self.leave_function(function);
         }
     }
@@ -700,6 +743,55 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         syn::visit::visit_expr_match(self, i);
     }
 
+    /// A closure: its `return`s are its own (extra mutations skip them).
+    fn visit_expr_closure(&mut self, i: &'ast syn::ExprClosure) {
+        self.return_repls.push(Vec::new());
+        syn::visit::visit_expr_closure(self, i);
+        self.return_repls.pop();
+    }
+
+    /// `return value` (extra mutations): the value replaced as the function's would be.
+    fn visit_expr_return(&mut self, i: &'ast syn::ExprReturn) {
+        if self.options.extra_mutations && !attrs_excluded(&i.attrs) {
+            let repls = self.return_repls.last().cloned().unwrap_or_default();
+            if let Some(value) = &i.expr {
+                self.collect_value_mutants(value, &repls);
+            }
+        }
+        syn::visit::visit_expr_return(self, i);
+    }
+
+    /// `if condition` (extra mutations): the condition replaced with `true` and `false`; an
+    /// `if let` is left alone.
+    fn visit_expr_if(&mut self, i: &'ast syn::ExprIf) {
+        if self.options.extra_mutations
+            && !attrs_excluded(&i.attrs)
+            && !matches!(&*i.cond, Expr::Let(_) | Expr::Lit(_))
+        {
+            for rep in [quote! { true }, quote! { false }] {
+                self.collect_mutant(i.cond.span().into(), None, &rep, Genre::Condition);
+            }
+        }
+        syn::visit::visit_expr_if(self, i);
+    }
+
+    /// `while condition` (extra mutations): the condition replaced with `false` (with `true`
+    /// it would most likely never end); a `while let` is left alone.
+    fn visit_expr_while(&mut self, i: &'ast syn::ExprWhile) {
+        if self.options.extra_mutations
+            && !attrs_excluded(&i.attrs)
+            && !matches!(&*i.cond, Expr::Let(_) | Expr::Lit(_))
+        {
+            self.collect_mutant(
+                i.cond.span().into(),
+                None,
+                &quote! { false },
+                Genre::Condition,
+            );
+        }
+        syn::visit::visit_expr_while(self, i);
+    }
+
     fn visit_expr_struct(&mut self, i: &'ast syn::ExprStruct) {
         let _span = trace_span!("struct", line = i.span().start().line).entered();
         trace!("visit struct expression");
@@ -745,6 +837,24 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                         }),
                     );
                     self.mutants.push(mutant);
+                }
+            }
+        }
+
+        // Each field's value replaced with `Default::default()` (extra mutations), where the
+        // field is written `name: value` and the value isn't that already.
+        if self.options.extra_mutations {
+            for field in &i.fields {
+                if field.colon_token.is_some() {
+                    let rep = quote! { Default::default() };
+                    if field.expr.to_token_stream().to_pretty_string() != rep.to_pretty_string() {
+                        self.collect_mutant(
+                            field.expr.span().into(),
+                            None,
+                            &rep,
+                            Genre::StructFieldValue,
+                        );
+                    }
                 }
             }
         }
@@ -1140,6 +1250,96 @@ mod test {
             mutants.iter().map(|m| m.name(false)).collect_vec(),
             ["src/main.rs: replace always_true -> bool with false"]
         );
+    }
+
+    fn extra() -> Options {
+        Options {
+            extra_mutations: true,
+            ..Options::default()
+        }
+    }
+
+    fn names(code: &str, options: &Options) -> Vec<String> {
+        mutate_source_str(code, options)
+            .unwrap()
+            .iter()
+            .map(|m| m.name(false))
+            .collect_vec()
+    }
+
+    /// `--extra-mutations`: inside unsafe fns; return values with the statements before them
+    /// kept (the tail, and `return`s, not a closure's); `if` conditions as true and false
+    /// (not `if let`), `while` conditions as false; struct literal field values. None of
+    /// these without it.
+    #[test]
+    fn extra_mutations() {
+        let code = indoc! {"
+            unsafe fn u() -> usize { 2 + 3 }
+            fn tail(x: &mut Vec<u8>) -> &mut [u8] {
+                assert!(x.len() > 1);
+                x.as_mut_slice()
+            }
+            fn early(b: &[u8], out: &mut u32) {
+                if b.is_empty() {
+                    return;
+                }
+                if let Some(f) = b.first() { *out = *f as u32; }
+                while b.len() > 9 { break; }
+                let c = |v: u32| -> u32 { if v > 0 { return 1; } 2 };
+                *out = c(*out);
+            }
+            fn give(n: u32) -> u32 {
+                if n == 0 {
+                    return n + 7;
+                }
+                n
+            }
+            fn lit(a: u64) -> S { S { a: a, b: Default::default() } }
+        "};
+        let extra = names(code, &extra());
+        let default = names(code, &Options::default());
+        let added = extra
+            .iter()
+            .filter(|n| !default.contains(n))
+            .map(|n| n.trim_start_matches("src/main.rs: "))
+            .collect_vec();
+        assert_eq!(
+            added,
+            [
+                "replace u -> usize with 0",
+                "replace u -> usize with 1",
+                "replace + with - in u",
+                "replace + with * in u",
+                "replace x.as_mut_slice() with Vec::leak(Vec::new()) in tail",
+                "replace x.as_mut_slice() with Vec::leak(vec![0]) in tail",
+                "replace x.as_mut_slice() with Vec::leak(vec![1]) in tail",
+                "replace b.is_empty() with true in early",
+                "replace b.is_empty() with false in early",
+                "replace b.len() > 9 with false in early",
+                "replace v > 0 with true in early",
+                "replace v > 0 with false in early",
+                "replace n with 0 in give",
+                "replace n with 1 in give",
+                "replace n == 0 with true in give",
+                "replace n == 0 with false in give",
+                "replace n + 7 with 0 in give",
+                "replace n + 7 with 1 in give",
+                "replace a with Default::default() in lit",
+            ]
+        );
+        // And every default mutant is still there, in order.
+        assert_eq!(
+            extra.iter().filter(|n| default.contains(n)).collect_vec(),
+            default.iter().collect_vec()
+        );
+        // A closure's `return` and an `if let` give none; a body of one expression gets no
+        // tail mutants beside its whole-body ones.
+        assert!(
+            !extra
+                .iter()
+                .any(|n| n.contains("Some(f)") || n.contains("replace 1 with"))
+        );
+        assert!(!extra.iter().any(|n| n.contains("replace 2 + 3")));
     }
 
     #[test]

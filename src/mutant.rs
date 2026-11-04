@@ -32,6 +32,13 @@ pub enum Genre {
     MatchArmGuard,
     /// Delete a field from a struct literal that has a base (default) expression.
     StructField,
+    /// Replace a function's tail expression, or the value of a `return`, with a fixed value,
+    /// keeping the statements before it (extra mutations).
+    ReturnValue,
+    /// Replace an `if` or `while` condition with `true` or `false` (extra mutations).
+    Condition,
+    /// Replace a struct literal field's value with `Default::default()` (extra mutations).
+    StructFieldValue,
 }
 
 /// The target of a mutation, providing additional context about what is being mutated.

@@ -119,6 +119,10 @@ pub struct Options {
     /// `::`.
     pub skip_calls: Vec<String>,
 
+    /// Generate the extra mutants: inside unsafe fns, return values, conditions, and struct
+    /// literal field values.
+    pub extra_mutations: bool,
+
     /// Cargo profile.
     pub profile: Option<String>,
 
@@ -381,6 +385,7 @@ impl Options {
             show_times: !args.no_times,
             show_all_logs: args.all_logs,
             skip_calls,
+            extra_mutations: args.extra_mutations || config.extra_mutations == Some(true),
             test_package,
             test_timeout: args.timeout.map(Duration::from_secs_f64),
             test_timeout_multiplier: args.timeout_multiplier.or(config.timeout_multiplier),
