@@ -840,7 +840,12 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                             struct_name: struct_name.clone(),
                         }),
                     );
-                    self.mutants.push(mutant);
+                    // As every other mutant (collect_mutant): --re and --exclude-re apply.
+                    if self.options.allows_mutant(&mutant) {
+                        self.mutants.push(mutant);
+                    } else {
+                        trace!(name = mutant.name(false), "skip mutant by options");
+                    }
                 }
             }
         }
@@ -1883,6 +1888,25 @@ mod test {
         );
         assert_eq!(mutate_expr("a >>= b"), &["replace >>= with <<="]);
         assert_eq!(mutate_expr("a <<= b"), &["replace <<= with >>="]);
+    }
+
+    /// Field deletions obey --re and --exclude-re, as every other mutant does: a
+    /// filter that names other mutants leaves them out.
+    #[test]
+    fn delete_struct_field_obeys_name_filters() {
+        let code = "fn f() -> Cat {\n    Cat { name: \"Felix\", ..Default::default() }\n}\n";
+        let names = |args: &[&str]| -> Vec<String> {
+            let options = Options::from_arg_strs(args.iter().copied());
+            mutate_source_str(code, &options).unwrap().iter().map(|m| m.name(false)).collect()
+        };
+        let all = names(&["mutants"]);
+        assert!(all.iter().any(|n| n.contains("delete field name from struct Cat expression")), "{all:?}");
+        let none = names(&["mutants", "--re", "NO_SUCH_MUTANT"]);
+        assert!(none.is_empty(), "--re that names nothing: {none:?}");
+        let excluded = names(&["mutants", "--exclude-re", "delete field"]);
+        assert!(!excluded.iter().any(|n| n.contains("delete field")), "--exclude-re: {excluded:?}");
+        let chosen = names(&["mutants", "--re", "delete field name"]);
+        assert_eq!(chosen.len(), 1, "--re that names the deletion alone: {chosen:?}");
     }
 
     #[test]
